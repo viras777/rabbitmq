@@ -249,6 +249,62 @@ class EventloopClient extends AsyncClient
     }
 
     /**
+     * Handle readable RabbitMQ socket.
+     *
+     * Bunny's Async\Client catches EOF/connection errors but leaves the
+     * read watcher alive until an asynchronous disconnect chain completes.
+     * On FreeBSD/kqueue this can result in endless EV_EOF notifications.
+     */
+    public function onDataAvailable()
+    {
+        try {
+            $this->read();
+        } catch (\Throwable $e) {
+            // IMPORTANT:
+            // EOF is a terminal state. Remove the socket from the event loop
+            // immediately, otherwise FreeBSD kqueue keeps returning EV_EOF.
+            $stream = $this->getStream();
+
+            if (is_resource($stream)) {
+                $this->eventLoop->offReadable($stream);
+                $this->closeStream();
+            }
+
+            // Notify pending Bunny promises/callbacks.
+            foreach ($this->awaitCallbacks as $k => $callback) {
+                if ($callback($e) === true) {
+                    unset($this->awaitCallbacks[$k]);
+                    break;
+                }
+            }
+
+            // Do NOT continue into consumeFrame() after EOF.
+            return;
+        }
+
+        while (($frame = $this->reader->consumeFrame($this->readBuffer)) !== null) {
+            foreach ($this->awaitCallbacks as $k => $callback) {
+                if ($callback($frame) === true) {
+                    unset($this->awaitCallbacks[$k]);
+                    continue 2;
+                }
+            }
+
+            if ($frame->channel === 0) {
+                $this->onFrameReceived($frame);
+            } else {
+                if (!isset($this->channels[$frame->channel])) {
+                    throw new \Bunny\Exception\ClientException(
+                        "Received frame #{$frame->type} on closed channel #{$frame->channel}."
+                    );
+                }
+
+                $this->channels[$frame->channel]->onFrameReceived($frame);
+            }
+        }
+    }
+
+    /**
      * Callback when heartbeat timer timed out.
      */
     public function onHeartbeat(): void
